@@ -1,0 +1,55 @@
+name: Deploy to Salesforce Org
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository code
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # 2. Install Salesforce CLI
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      # 3. Create server.key file from GitHub Secret
+      - name: Save JWT Key File
+        run: echo "${{ secrets.SF_JWT_KEY }}" > server.key
+
+      # 4. Authenticate to Salesforce Org using JWT
+      - name: Authenticate to Salesforce
+        run: |
+          sf org login jwt \
+            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
+            --jwt-key-file server.key \
+            --username ${{ secrets.SF_USERNAME }} \
+            --instance-url ${{ secrets.SF_INSTANCE_URL }} \
+            --set-default
+
+      # 5. STEP 1: Dry-Run Validation & Test Coverage Gate (>= 85%)
+      - name: Validate Deployment & Run Apex Tests
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --test-level RunLocalTests \
+            --met-package-coverage-length 85 \
+            --coverage-formatters summary \
+            --wait 30
+
+      # 6. STEP 2: Deploy to Salesforce (Only executes if Step 5 succeeds!)
+      - name: Deploy Source to Salesforce Org
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --wait 30
+
+      # 7. Clean up secret file
+      - name: Clean up Key File
+        if: always()
+        run: rm -f server.key
