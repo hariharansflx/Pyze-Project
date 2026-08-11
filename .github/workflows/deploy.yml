@@ -14,15 +14,21 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # 2. Install Salesforce CLI
+      # 2. Setup Python environment
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # 3. Install Salesforce CLI
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli
 
-      # 3. Create server.key file from GitHub Secret
+      # 4. Create server.key file from GitHub Secret
       - name: Save JWT Key File
         run: echo "${{ secrets.SF_JWT_KEY }}" > server.key
 
-      # 4. Authenticate to Salesforce Org using JWT
+      # 5. Authenticate to Salesforce Org using JWT
       - name: Authenticate to Salesforce
         run: |
           sf org login jwt \
@@ -32,24 +38,87 @@ jobs:
             --instance-url ${{ secrets.SF_INSTANCE_URL }} \
             --set-default
 
-      # 5. STEP 1: Dry-Run Validation & Test Coverage Gate (>= 85%)
-      - name: Validate Deployment & Enforce >=85% Code Coverage
+      # 6. Run Dry-Run Validation and Save JSON Output
+      - name: Run Dry-Run Validation
         run: |
-          sf project deploy validate \
+          sf project deploy start \
             --source-dir force-app \
             --test-level RunLocalTests \
-            --met-package-coverage-length 85 \
-            --coverage-formatters text-summary \
-            --wait 30
+            --dry-run \
+            --json > deploy_result.json || echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
 
-      # 6. STEP 2: Deploy to Salesforce (Only executes if Step 5 succeeds!)
+      # 7. Calculate Code Coverage & Enforce >= 85% Gate
+      - name: Check Code Coverage Threshold (>= 85%)
+        run: |
+          COVERAGE=$(python3 -c "
+          import json
+          try:
+              with open('deploy_result.json') as f:
+                  data = json.load(f)
+                  result_data = data.get('result', {})
+                  if isinstance(result_data, str):
+                      print('0')
+                      exit(0)
+                      
+                  details = result_data.get('details', {})
+                  test_result = details.get('runTestResult', {})
+                  code_coverage = test_result.get('codeCoverage', [])
+                  
+                  if not code_coverage:
+                      print('0')
+                      exit(0)
+                      
+                  total_num_lines = 0
+                  total_num_uncovered = 0
+                  
+                  for item in code_coverage:
+                      locs = item.get('numLocations', 0)
+                      uncovered_locs = item.get('numLocationsNotCovered', 0)
+                      
+                      num_loc = len(locs) if isinstance(locs, list) else int(locs)
+                      num_uncovered = len(uncovered_locs) if isinstance(uncovered_locs, list) else int(uncovered_locs)
+                      
+                      total_num_lines += num_loc
+                      total_num_uncovered += num_uncovered
+                      
+                  if total_num_lines == 0:
+                      print('0')
+                  else:
+                      covered_lines = total_num_lines - total_num_uncovered
+                      percentage = (covered_lines / total_num_lines) * 100
+                      print(f'{percentage:.2f}')
+          except Exception as e:
+              print('0')
+          ")
+
+          echo "Calculated Code Coverage: $COVERAGE%"
+
+          if [ "$DEPLOY_FAILED" = "true" ]; then
+            echo "===================================================="
+            echo "ERROR: Salesforce deployment validation failed!"
+            echo "===================================================="
+            exit 1
+          fi
+
+          IS_LESS_THAN_85=$(python3 -c "print('yes' if float($COVERAGE) < 85.0 else 'no')")
+
+          if [ "$IS_LESS_THAN_85" == "yes" ]; then
+            echo "===================================================="
+            echo "ERROR: Code coverage is $COVERAGE%, which is below the required 85%!"
+            echo "===================================================="
+            exit 1
+          else
+            echo "SUCCESS: Code coverage is $COVERAGE% (>= 85%). Proceeding to deploy."
+          fi
+
+      # 8. STEP 2: Deploy Source to Salesforce Org (Only executes if Steps 6 & 7 pass)
       - name: Deploy Source to Salesforce Org
         run: |
           sf project deploy start \
             --source-dir force-app \
             --wait 30
 
-      # 7. Clean up secret file
+      # 9. Clean up secret file
       - name: Clean up Key File
         if: always()
-        run: rm -f server.key
+        run: rm -f server.key deploy_result.json
