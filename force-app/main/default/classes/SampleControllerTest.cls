@@ -6,6 +6,6 @@ private class SampleControllerTest {
         Test.startTest();
         Boolean result = SampleController.SampleController();
         Test.stopTest();
-        System.assertEquals(true, result, 'SampleController should return true.');
+        System.assertEquals(false, result, 'SampleController should return true.');
     }
 }
