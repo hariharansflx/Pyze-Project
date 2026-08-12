@@ -38,87 +38,169 @@ jobs:
             --instance-url ${{ secrets.SF_INSTANCE_URL }} \
             --set-default
 
-      # 6. Run Dry-Run Validation and Save JSON Output
+      # 6. Run Dry-Run Validation (do NOT let the step fail the job here —
+      #    we want to inspect the JSON ourselves and print a proper reason)
       - name: Run Dry-Run Validation
+        id: validate
         run: |
+          set +e
           sf project deploy start \
             --source-dir force-app \
             --test-level RunLocalTests \
             --dry-run \
-            --json > deploy_result.json || echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+            --json > deploy_result.json
+          echo "sf_exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
 
-      # 7. Calculate Code Coverage & Enforce >= 85% Gate
+      # 7. Check validation result FIRST. Only if it truly succeeded do we
+      #    move on to the coverage gate.
+      - name: Check Validation Result
+        id: check_validation
+        run: |
+          python3 <<'EOF'
+          import json, os, sys
+
+          sf_exit_code = int(os.environ.get("SF_EXIT_CODE", "1"))
+
+          if not os.path.exists("deploy_result.json") or os.path.getsize("deploy_result.json") == 0:
+              print("=" * 60)
+              print("ERROR: No deploy_result.json produced by sf CLI.")
+              print("The Salesforce CLI likely crashed or auth failed.")
+              print("=" * 60)
+              sys.exit(1)
+
+          try:
+              with open("deploy_result.json") as f:
+                  data = json.load(f)
+          except json.JSONDecodeError as e:
+              print("ERROR: deploy_result.json is not valid JSON:", e)
+              sys.exit(1)
+
+          result = data.get("result", {})
+          # 'result' can be a plain string on hard failures (e.g. auth/org errors)
+          result_success = None
+          if isinstance(result, dict):
+              result_success = result.get("success")
+
+          validation_failed = (
+              sf_exit_code != 0
+              or isinstance(result, str)
+              or result_success is False
+          )
+
+          if validation_failed:
+              print("=" * 60)
+              print("VALIDATION FAILED - deployment will NOT proceed")
+              print("=" * 60)
+              print("Top-level message:", data.get("message", "No top-level error message."))
+
+              if isinstance(result, str):
+                  print("Result:", result)
+
+              if isinstance(result, dict):
+                  details = result.get("details", {})
+
+                  comp_failures = details.get("componentFailures", [])
+                  if isinstance(comp_failures, dict):
+                      comp_failures = [comp_failures]
+                  if comp_failures:
+                      print("\nComponent Failures:")
+                      for cf in comp_failures:
+                          print(f"  - {cf.get('problemType')}: {cf.get('fileName')} "
+                                f"-> {cf.get('problem')}")
+
+                  test_result = details.get("runTestResult", {})
+                  test_failures = test_result.get("failures", [])
+                  if isinstance(test_failures, dict):
+                      test_failures = [test_failures]
+                  if test_failures:
+                      print("\nApex Test Failures:")
+                      for tf in test_failures:
+                          print(f"  - {tf.get('name')}.{tf.get('methodName')}: "
+                                f"{tf.get('message')}")
+                          if tf.get("stackTrace"):
+                              print(f"    stackTrace: {tf.get('stackTrace')}")
+
+                  code_cov_warnings = details.get("runTestResult", {}).get("codeCoverageWarnings", [])
+                  if code_cov_warnings:
+                      print("\nCode Coverage Warnings:")
+                      for w in code_cov_warnings:
+                          print(f"  - {w.get('name', '')}: {w.get('message')}")
+
+              sys.exit(1)
+
+          print("Validation succeeded. Proceeding to coverage check.")
+          EOF
+        env:
+          SF_EXIT_CODE: ${{ steps.validate.outputs.sf_exit_code }}
+
+      # 8. Coverage gate — only runs because step 7 exits 1 (and job stops)
+      #    on any validation failure. This step only ever sees a passing validation.
       - name: Check Code Coverage Threshold (>= 85%)
         run: |
-          COVERAGE=$(python3 -c "
-          import json
-          try:
-              with open('deploy_result.json') as f:
-                  data = json.load(f)
-                  result_data = data.get('result', {})
-                  if isinstance(result_data, str):
-                      print('0')
-                      exit(0)
-                      
-                  details = result_data.get('details', {})
-                  test_result = details.get('runTestResult', {})
-                  code_coverage = test_result.get('codeCoverage', [])
-                  
-                  if not code_coverage:
-                      print('0')
-                      exit(0)
-                      
-                  total_num_lines = 0
-                  total_num_uncovered = 0
-                  
-                  for item in code_coverage:
-                      locs = item.get('numLocations', 0)
-                      uncovered_locs = item.get('numLocationsNotCovered', 0)
-                      
-                      num_loc = len(locs) if isinstance(locs, list) else int(locs)
-                      num_uncovered = len(uncovered_locs) if isinstance(uncovered_locs, list) else int(uncovered_locs)
-                      
-                      total_num_lines += num_loc
-                      total_num_uncovered += num_uncovered
-                      
-                  if total_num_lines == 0:
-                      print('0')
-                  else:
-                      covered_lines = total_num_lines - total_num_uncovered
-                      percentage = (covered_lines / total_num_lines) * 100
-                      print(f'{percentage:.2f}')
-          except Exception as e:
-              print('0')
-          ")
+          python3 <<'EOF'
+          import json, sys
 
-          echo "Calculated Code Coverage: $COVERAGE%"
+          with open("deploy_result.json") as f:
+              data = json.load(f)
 
-          if [ "$DEPLOY_FAILED" = "true" ]; then
-            echo "===================================================="
-            echo "ERROR: Salesforce deployment validation failed!"
-            echo "===================================================="
-            exit 1
-          fi
+          result = data.get("result", {})
+          details = result.get("details", {}) if isinstance(result, dict) else {}
+          test_result = details.get("runTestResult", {})
+          code_coverage = test_result.get("codeCoverage", [])
 
-          IS_LESS_THAN_85=$(python3 -c "print('yes' if float($COVERAGE) < 85.0 else 'no')")
+          if not code_coverage:
+              print("ERROR: No code coverage data found in validation result.")
+              sys.exit(1)
 
-          if [ "$IS_LESS_THAN_85" == "yes" ]; then
-            echo "===================================================="
-            echo "ERROR: Code coverage is $COVERAGE%, which is below the required 85%!"
-            echo "===================================================="
-            exit 1
-          else
-            echo "SUCCESS: Code coverage is $COVERAGE% (>= 85%). Proceeding to deploy."
-          fi
+          total_lines = 0
+          total_uncovered = 0
+          for item in code_coverage:
+              locs = item.get("numLocations", 0)
+              uncovered = item.get("numLocationsNotCovered", 0)
+              total_lines += len(locs) if isinstance(locs, list) else int(locs)
+              total_uncovered += len(uncovered) if isinstance(uncovered, list) else int(uncovered)
 
-      # 8. STEP 2: Deploy Source to Salesforce Org (Only executes if Steps 6 & 7 pass)
+          coverage = 0.0 if total_lines == 0 else ((total_lines - total_uncovered) / total_lines) * 100
+          print(f"Calculated Code Coverage: {coverage:.2f}%")
+
+          if coverage < 85.0:
+              print("=" * 60)
+              print(f"ERROR: Code coverage is {coverage:.2f}%, below the required 85%.")
+              print("=" * 60)
+
+              class_coverage = sorted(
+                  code_coverage,
+                  key=lambda i: (
+                      (len(i.get("numLocationsNotCovered", []))
+                       if isinstance(i.get("numLocationsNotCovered"), list)
+                       else int(i.get("numLocationsNotCovered", 0)))
+                  ),
+                  reverse=True,
+              )
+              print("\nLowest-covered components (most uncovered lines first):")
+              for item in class_coverage[:10]:
+                  name = item.get("name", "unknown")
+                  locs = item.get("numLocations", 0)
+                  unc = item.get("numLocationsNotCovered", 0)
+                  n_locs = len(locs) if isinstance(locs, list) else int(locs)
+                  n_unc = len(unc) if isinstance(unc, list) else int(unc)
+                  pct = 0.0 if n_locs == 0 else ((n_locs - n_unc) / n_locs) * 100
+                  print(f"  - {name}: {pct:.2f}% ({n_unc} uncovered of {n_locs})")
+
+              sys.exit(1)
+
+          print(f"SUCCESS: Code coverage is {coverage:.2f}% (>= 85%). Proceeding to deploy.")
+          EOF
+
+      # 9. Deploy only runs if steps 7 AND 8 both exited 0
       - name: Deploy Source to Salesforce Org
         run: |
           sf project deploy start \
             --source-dir force-app \
             --wait 30
 
-      # 9. Clean up secret file
+      # 10. Clean up temporary files (always runs, even on failure)
       - name: Clean up Key File
         if: always()
         run: rm -f server.key deploy_result.json
