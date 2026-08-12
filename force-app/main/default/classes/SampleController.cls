@@ -1,7 +1,7 @@
 public with sharing class SampleController {
     public static boolean SampleController(String param1) {
         String string1 = 'Hello';
-        if(param1 != null && !param1.isEmpty() && param1 == 'Hello') {
+        if(param1 != null && param1 == 'Hello') {
             System.debug('Parameter is valid: ' + param1);
             String string2 = 'World';
             String concatenatedString1 = string1 + ' ' ;
